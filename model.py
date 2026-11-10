@@ -76,6 +76,31 @@ class StaticKVCache:
         self.length += n
 
 
+class SlotKVCache:
+    """Cache for continuous batching: one independent sequence per slot.
+
+    Unlike StaticKVCache (one shared length), every slot has its own length in
+    `lens`, so slots can hold sequences at different points and be refilled
+    with a new request the moment the old one finishes.
+    Buffers are zero-initialised: masked-out positions must hold finite values.
+    """
+
+    def __init__(self, n_layer, slots, n_head, max_len, head_dim, device, dtype):
+        shape = (slots, n_head, max_len, head_dim)
+        self.k = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layer)]
+        self.v = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layer)]
+        self.lens = torch.zeros(slots, dtype=torch.long, device=device)  # tokens cached per slot
+        self.kv_len = 1  # how many key positions this decode step attends over
+        self.max_len = max_len
+
+    def update(self, layer: int, k: torch.Tensor, v: torch.Tensor):
+        """Decode-step write: k, v are (slots, n_head, 1, head_dim)."""
+        idx = torch.arange(k.size(0), device=k.device)
+        self.k[layer][idx, :, self.lens] = k[:, :, 0]  # each slot writes at its own position
+        self.v[layer][idx, :, self.lens] = v[:, :, 0]
+        return self.k[layer][:, :, : self.kv_len], self.v[layer][:, :, : self.kv_len]
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: GPT2Config):
         super().__init__()
@@ -169,6 +194,22 @@ class GPT2(nn.Module):
             cache.advance(T)
         x = self.ln_f(x)
         return F.linear(x, self.wte.weight)  # lm_head is tied to wte
+
+    def decode_slots(self, tokens, cache, kv_len: int):
+        """One decode step for every slot at once (continuous batching).
+
+        tokens: (slots, 1) the last token of each slot's sequence.
+        cache.lens[i] is that token's position. Returns logits (slots, vocab).
+        """
+        dev = tokens.device
+        cache.kv_len = kv_len
+        # slot i may attend to keys 0..lens[i] (its own new key is written at lens[i])
+        mask = (torch.arange(kv_len, device=dev)[None, :] <= cache.lens[:, None])[:, None, None, :]
+        x = self.wte(tokens) + self.wpe(cache.lens)[:, None, :]
+        for i, block in enumerate(self.h):
+            x = block(x, i, cache, mask)
+        x = self.ln_f(x)
+        return F.linear(x, self.wte.weight)[:, 0, :]
 
 
 def load_gpt2(device: str = "cuda", dtype: torch.dtype = torch.float32) -> GPT2:
